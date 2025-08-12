@@ -1,0 +1,121 @@
+name: Daily WTF Facts (Option B)
+
+on:
+  schedule:
+    # 07:00 UTC = 09:00 Paris (été)
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make output folder
+        run: mkdir -p out
+
+      - name: Run orchestrator (Python inline)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          python - <<'PY'
+          import os, json, base64, time, requests
+
+          OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+          ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
+          ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
+          RENDER_URL = os.environ["RENDER_URL"].rstrip("/")
+
+          def openai_chat():
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+            sys = "Tu écris des scripts FR de 60s (hook ≤ 8 mots, phrases courtes). Réponds en JSON strict."
+            usr = (
+              "Génère une vidéo 'WTF Facts' 60s. Réponds EXACTEMENT avec : "
+              "{ \"title\":\"...\", \"hashtags\":[\"#...\",\"#...\"], \"script\": { "
+              "\"hook\":\"...\", \"body\":[\"...\",\"...\",\"...\"], \"twist\":\"...\", "
+              "\"cta\":\"Abonne-toi pour en savoir plus !\" }, "
+              "\"image_prompts\":[\"Ultra detailed cinematic image of ... (9:16)\",\"... (9:16)\",\"... (9:16)\",\"... (9:16)\"] } "
+              "Contrainte: 115–140 mots (hors CTA). Sujet fascinant grand public, safe."
+            )
+            data = {
+              "model":"gpt-4o-mini",
+              "response_format":{"type":"json_object"},
+              "messages":[{"role":"system","content":sys},{"role":"user","content":usr}]
+            }
+            r = requests.post(url, headers=headers, json=data, timeout=60)
+            r.raise_for_status()
+            return json.loads(r.json()["choices"][0]["message"]["content"])
+
+          def openai_image(prompt):
+            url = "https://api.openai.com/v1/images/generations"
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+            data = {"model":"gpt-image-1","prompt":prompt,"size":"1024x1792"}  # vertical
+            r = requests.post(url, headers=headers, json=data, timeout=120)
+            r.raise_for_status()
+            return r.json()["data"][0]["b64_json"]
+
+          def elevenlabs_tts(text):
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+            headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept":"audio/mpeg", "Content-Type":"application/json"}
+            payload = {
+              "text": text,
+              "voice_settings": {"stability":0.4, "similarity_boost":0.6}
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=120)
+            r.raise_for_status()
+            return base64.b64encode(r.content).decode("utf-8")  # mp3 b64
+
+          print("→ Génération du script…")
+          pack = openai_chat()
+          title = pack["title"]
+          hook  = pack["script"]["hook"]
+          body  = " ".join(pack["script"]["body"])
+          twist = pack["script"]["twist"]
+          cta   = pack["script"]["cta"]
+          full_text = f"{hook} {body} {twist} {cta}"
+
+          print("→ Génération des images…")
+          images_b64 = []
+          for p in pack["image_prompts"]:
+            images_b64.append(openai_image(p))
+            time.sleep(1)
+
+          print("→ Génération de la voix…")
+          voice_b64 = elevenlabs_tts(full_text)
+
+          payload = {
+            "title": title,
+            "script": {
+              "hook": hook,
+              "body": pack["script"]["body"],
+              "twist": twist,
+              "cta": cta
+            },
+            "image_b64": images_b64,
+            "voice_b64": voice_b64,
+            "watermark_text": "WTF Facts • @toncompte",
+            "return_b64": True
+          }
+
+          print("→ Envoi au renderer…")
+          r = requests.post(f"{RENDER_URL}/render", json=payload, timeout=600)
+          r.raise_for_status()
+          out = r.json()
+          mp4_b64 = out["mp4_b64"]
+          mp4 = base64.b64decode(mp4_b64)
+          with open("out/final.mp4","wb") as f:
+            f.write(mp4)
+          with open("out/meta.json","w",encoding="utf-8") as f:
+            json.dump({"title": title}, f, ensure_ascii=False, indent=2)
+
+          print("✅ OK, vidéo générée.")
+          PY
+
+      - name: Upload artifact (final.mp4)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wtf-fact-video
+          path: out/
