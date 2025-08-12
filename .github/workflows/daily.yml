@@ -1,9 +1,9 @@
 name: Daily WTF Facts Video
 
 on:
-  workflow_dispatch:   # Permet lancement manuel
+  workflow_dispatch:        # Lancement manuel depuis l’onglet Actions
   schedule:
-    - cron: '0 8 * * *' # Tous les jours à 8h UTC
+    - cron: '0 8 * * *'     # Tous les jours à 08:00 UTC (10:00 Paris en été)
 
 jobs:
   build-video:
@@ -11,17 +11,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run orchestrator (with retry)
+      - name: Run orchestrator (OpenAI + ElevenLabs + Renderer)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
@@ -36,65 +36,89 @@ jobs:
           ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
           RENDER_URL = os.environ["RENDER_URL"].rstrip("/")
 
+          # -------- Utils: retry exponentiel (gère 429/5xx) --------
           def request_with_retry(method, url, **kwargs):
               for attempt in range(5):
-                  r = requests.request(method, url, timeout=120, **kwargs)
+                  r = requests.request(method, url, timeout=180, **kwargs)
                   if r.status_code < 400:
                       return r
                   if r.status_code in (429, 500, 502, 503, 504):
                       wait = (2 ** attempt) + random.uniform(0, 0.5)
-                      print(f"⚠️ API limit, retry dans {wait:.1f}s...")
+                      print(f"⚠️ {r.status_code} {url} -> retry in {wait:.1f}s")
+                      try: print("Body:", r.text[:300])
+                      except: pass
                       time.sleep(wait)
                       continue
+                  # autre erreur : on sort en affichant le corps
+                  try: print("Body:", r.text[:300])
+                  except: pass
                   r.raise_for_status()
+              print("❌ After retries:", r.status_code, r.text[:600])
               r.raise_for_status()
 
+          # -------- 1) Script & prompts avec Chat --------
           def openai_chat():
               url = "https://api.openai.com/v1/chat/completions"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
               sys = "Tu écris des scripts FR de 60s (hook ≤ 8 mots, phrases courtes). Réponds en JSON strict."
               usr = (
-                  "Génère une vidéo 'WTF Facts' 60s. Réponds EXACTEMENT avec : "
-                  "{ \"title\":\"...\", \"hashtags\":[\"#...\",\"#...\"], \"script\": { "
-                  "\"hook\":\"...\", \"body\":[\"...\",\"...\",\"...\"], \"twist\":\"...\", "
-                  "\"cta\":\"Abonne-toi pour en savoir plus !\" }, "
-                  "\"image_prompts\":[\"Ultra detailed cinematic image of ... (9:16)\",\"... (9:16)\",\"... (9:16)\",\"... (9:16)\"] } "
-                  "Contrainte: 115–140 mots (hors CTA). Sujet fascinant grand public, safe."
+                "Génère une vidéo 'WTF Facts' 60s. Réponds EXACTEMENT avec : "
+                "{ \"title\":\"...\", \"hashtags\":[\"#...\",\"#...\"], \"script\": { "
+                "\"hook\":\"...\", \"body\":[\"...\",\"...\",\"...\"], \"twist\":\"...\", "
+                "\"cta\":\"Abonne-toi pour en savoir plus !\" }, "
+                "\"image_prompts\":[\"Ultra detailed cinematic image of ... (9:16)\",\"... (9:16)\",\"... (9:16)\",\"... (9:16)\"] } "
+                "Contrainte: 115–140 mots (hors CTA). Sujet fascinant grand public, safe."
               )
               data = {
-                  "model": "gpt-4o-mini",
-                  "response_format": {"type": "json_object"},
-                  "messages": [{"role": "system", "content": sys}, {"role": "user", "content": usr}]
+                "model": "gpt-4o-mini",
+                "response_format": {"type": "json_object"},
+                "messages": [
+                  {"role":"system","content": sys},
+                  {"role":"user","content": usr}
+                ]
               }
               r = request_with_retry("POST", url, headers=headers, json=data)
               return json.loads(r.json()["choices"][0]["message"]["content"])
 
+          # -------- 2) Images : 1 appel en 1024x1024 + fallback --------
           def openai_images(prompts):
               url = "https://api.openai.com/v1/images/generations"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+              # a) tentative: 1 seul appel, 4 images (taille universelle)
               data = {
-                  "model": "gpt-image-1",
-                  "prompt": prompts[0],  # on peut aussi fusionner tous les prompts en un seul
-                  "n": 4,
-                  "size": "1024x1792"
+                "model": "gpt-image-1",
+                "prompt": " ; ".join(prompts),   # on combine pour la variété
+                "n": 4,
+                "size": "1024x1024"
               }
               r = request_with_retry("POST", url, headers=headers, json=data)
-              return [item["b64_json"] for item in r.json()["data"]]
+              if r.status_code < 400 and "data" in r.json():
+                  return [it["b64_json"] for it in r.json()["data"]]
 
+              # b) fallback: 4 appels séparés
+              imgs = []
+              for p in prompts:
+                  r2 = request_with_retry("POST", url, headers=headers,
+                                          json={"model":"gpt-image-1","prompt": p, "n":1, "size":"1024x1024"})
+                  imgs.append(r2.json()["data"][0]["b64_json"])
+              return imgs
+
+          # -------- 3) Voix ElevenLabs --------
           def elevenlabs_tts(text):
               url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
               headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
               payload = { "text": text, "voice_settings": { "stability": 0.4, "similarity_boost": 0.6 } }
               r = request_with_retry("POST", url, headers=headers, json=payload)
-              return base64.b64encode(r.content).decode("utf-8")
+              return base64.b64encode(r.content).decode("utf-8")  # mp3 en base64
 
           print("→ Génération du script…")
           pack = openai_chat()
           title = pack["title"]
-          hook = pack["script"]["hook"]
+          hook  = pack["script"]["hook"]
           bodyL = pack["script"]["body"]
           twist = pack["script"]["twist"]
-          cta = pack["script"]["cta"]
+          cta   = pack["script"]["cta"]
           full_text = " ".join([hook] + bodyL + [twist, cta])
 
           print("→ Génération des images (1 appel)…")
@@ -103,16 +127,36 @@ jobs:
           print("→ Génération de la voix…")
           voice_b64 = elevenlabs_tts(full_text)
 
+          # -------- 4) Appel à ton renderer --------
           payload = {
-              "title": title,
-              "script": {"hook": hook, "body": bodyL, "twist": twist, "cta": cta},
-              "image_b64": images_b64,
-              "voice_b64": voice_b64,
-              "watermark_text": "WTF Facts • @toncompte",
-              "return_url": None
+            "title": title,
+            "script": {"hook": hook, "body": bodyL, "twist": twist, "cta": cta},
+            "image_b64": images_b64,
+            "voice_b64": voice_b64,
+            "watermark_text": "WTF Facts • @toncompte",
+            "return_b64": True
           }
 
-          print("→ Envoi au service Render…")
+          print("→ Envoi au renderer…")
           r = request_with_retry("POST", f"{RENDER_URL}/render", json=payload)
-          print("✅ Vidéo générée :", r.json())
+          out = r.json()
+
+          mp4_b64 = out.get("mp4_b64")
+          if not mp4_b64 and "url" in out:
+              # Si ton renderer renvoie une URL (S3), on la télécharge
+              print("↘️ Téléchargement depuis URL :", out["url"])
+              mp4 = requests.get(out["url"], timeout=300).content
+          else:
+              mp4 = base64.b64decode(mp4_b64)
+
+          with open("final.mp4","wb") as f:
+              f.write(mp4)
+
+          print("✅ Vidéo générée :", title)
           PY
+
+      - name: Upload artifact (final.mp4)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wtf-fact-video
+          path: final.mp4
